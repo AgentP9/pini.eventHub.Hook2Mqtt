@@ -322,8 +322,8 @@ def create_app(
         try:
             processed = event_processor.process_webhook(payload)
             return jsonify({"status": "ok", "processed": processed}), 200
-        except ValueError as exc:
-            return jsonify({"status": "error", "error": str(exc)}), 400
+        except ValueError:
+            return jsonify({"status": "error", "error": "Invalid webhook payload"}), 400
         except Exception:
             logger.exception("Unexpected webhook processing error")
             return jsonify({"status": "error", "error": "Internal server error"}), 500
