@@ -19,7 +19,7 @@ docker compose up --build
 ### Test
 
 ```bash
-curl -X POST http://localhost:8080/webhook \
+curl -X POST http://localhost:4040/webhook \
   -H "Content-Type: application/json" \
   -d '{"message":"hello"}'
 ```
