@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import base64
 import json
 import logging
 import os
@@ -13,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import paho.mqtt.client as mqtt
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, render_template_string, request, send_file
 
 DEFAULT_SOURCE = "unifi_protect"
 DEFAULT_PRESENCE_TOPIC_PREFIX = "unifi/protect/presence"
@@ -69,6 +70,7 @@ class Config:
     presence_timeout: int = 180
     camera_map: dict[str, str] = field(default_factory=dict)
     log_level: str = "INFO"
+    thumbnail_path: str = "/tmp/latest_thumbnail.jpg"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -87,6 +89,7 @@ class Config:
             presence_timeout=max(1, parse_int(os.getenv("PRESENCE_TIMEOUT"), 180)),
             camera_map=parse_camera_map(os.getenv("CAMERA_MAP")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
+            thumbnail_path=os.getenv("THUMBNAIL_PATH", "/tmp/latest_thumbnail.jpg"),
         )
 
 
@@ -287,10 +290,142 @@ class EventProcessor:
                 self._logger.info("Presence timeout reached")
 
 
+_FRONTEND_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>piniHook2Mqtt \u2013 Latest Event</title>
+  <meta http-equiv="refresh" content="5">
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: sans-serif; margin: 2rem; background: #1a1a2e; color: #eee; }
+    h1 { color: #e94560; margin: 0 0 1.5rem; }
+    .card { background: #16213e; border-radius: 8px; padding: 1.5rem; max-width: 640px; }
+    .card img { width: 100%; border-radius: 4px; display: block; margin-bottom: 1rem; }
+    .badge { display: inline-block; padding: .2rem .7rem; border-radius: 4px;
+             background: #e94560; font-weight: bold; font-size: .85rem;
+             text-transform: uppercase; letter-spacing: .05em; margin-bottom: 1rem; }
+    table { width: 100%; border-collapse: collapse; }
+    td { padding: .4rem .5rem; border-bottom: 1px solid #0f3460; word-break: break-all; }
+    td:first-child { color: #a8a8b3; width: 40%; }
+    .muted { color: #a8a8b3; font-style: italic; }
+    footer { margin-top: 2rem; color: #a8a8b3; font-size: .8rem; }
+  </style>
+</head>
+<body>
+  <h1>Latest Event</h1>
+  {% if event %}
+  <div class="card">
+    <span class="badge">{{ event.type }}</span>
+    {% if has_image %}
+    <img src="/latest-image?t={{ ts }}" alt="Event thumbnail">
+    {% else %}
+    <p class="muted">No thumbnail available</p>
+    {% endif %}
+    <table>
+      <tr><td>Camera</td><td>{{ event.camera }}</td></tr>
+      {% if event.zone %}
+      <tr><td>Zone</td><td>{{ event.zone }}</td></tr>
+      {% endif %}
+      <tr><td>Event ID</td><td>{{ event.eventId }}</td></tr>
+      {% if event.timestamp is not none %}
+      <tr><td>Timestamp</td><td>{{ event.timestamp }}</td></tr>
+      {% endif %}
+      {% if event.score is not none %}
+      <tr><td>Score</td><td>{{ event.score }}</td></tr>
+      {% endif %}
+    </table>
+  </div>
+  {% else %}
+  <p class="muted">No events received yet.</p>
+  {% endif %}
+  <footer>Auto-refreshes every 5 seconds.</footer>
+</body>
+</html>
+"""
+
+
+class LatestEventStore:
+    """Thread-safe store for the most recent webhook event metadata and thumbnail."""
+
+    def __init__(self, image_path: str) -> None:
+        self._image_path = image_path
+        self._lock = threading.Lock()
+        self._latest: dict[str, Any] | None = None
+        self._has_image = False
+
+    def update(self, meta: dict[str, Any], thumbnail_b64: str | None) -> None:
+        """Persist event metadata; write thumbnail JPEG to disk if provided."""
+        saved = False
+        if thumbnail_b64:
+            try:
+                raw = thumbnail_b64.split(",", 1)[-1] if "," in thumbnail_b64 else thumbnail_b64
+                with open(self._image_path, "wb") as fh:
+                    fh.write(base64.b64decode(raw, validate=True))
+                saved = True
+            except Exception:
+                pass
+        with self._lock:
+            self._latest = dict(meta)
+            if thumbnail_b64:
+                self._has_image = saved
+
+    def get_latest(self) -> dict[str, Any] | None:
+        """Return a copy of the latest event metadata, or None if not yet set."""
+        with self._lock:
+            return dict(self._latest) if self._latest else None
+
+    @property
+    def has_image(self) -> bool:
+        """True if a thumbnail has been successfully written to disk."""
+        with self._lock:
+            return self._has_image
+
+    @property
+    def image_path(self) -> str:
+        return self._image_path
+
+
+def _extract_event_meta(
+    payload: dict[str, Any], camera_map: dict[str, str]
+) -> tuple[dict[str, Any], str | None] | None:
+    """Extract event metadata and thumbnail from a raw webhook payload.
+
+    Returns ``(meta, thumbnail_b64)`` for the first valid trigger, or ``None``
+    if the payload contains no usable trigger.
+    """
+    alarm = payload.get("alarm")
+    if not isinstance(alarm, dict):
+        return None
+    triggers = alarm.get("triggers")
+    if not isinstance(triggers, list) or not triggers:
+        return None
+    trigger = next((t for t in triggers if isinstance(t, dict)), None)
+    if trigger is None:
+        return None
+    source_event = trigger.get("sourceEvent") or {}
+    if not isinstance(source_event, dict):
+        source_event = {}
+    camera = str(trigger.get("device", ""))
+    meta: dict[str, Any] = {
+        "type": str(trigger.get("key", "unknown")),
+        "camera": camera,
+        "eventId": str(trigger.get("eventId", "")),
+        "timestamp": trigger.get("timestamp"),
+        "score": source_event.get("score"),
+        "zone": camera_map.get(camera),
+    }
+    thumbnail = alarm.get("thumbnail")
+    return meta, thumbnail if isinstance(thumbnail, str) else None
+
+
 def create_app(
     config: Config | None = None,
     publisher: MqttPublisher | None = None,
     processor: EventProcessor | None = None,
+    event_store: "LatestEventStore | None" = None,
 ) -> Flask:
     """Create and configure the Flask application and background services."""
     runtime_config = config or Config.from_env()
@@ -310,11 +445,33 @@ def create_app(
     if processor is None:
         event_processor.start()
 
+    latest_store = event_store or LatestEventStore(runtime_config.thumbnail_path)
+
     app = Flask(__name__)
     app.config["service_config"] = runtime_config
     app.config["event_processor"] = event_processor
     app.config["mqtt_publisher"] = mqtt_publisher
     app.config["service_logger"] = logger
+    app.config["event_store"] = latest_store
+
+    @app.get("/")
+    def index() -> tuple[Any, int]:
+        event = latest_store.get_latest()
+        return (
+            render_template_string(
+                _FRONTEND_HTML,
+                event=event,
+                has_image=latest_store.has_image,
+                ts=int(time.time()),
+            ),
+            200,
+        )
+
+    @app.get("/latest-image")
+    def latest_image() -> tuple[Any, int]:
+        if not latest_store.has_image or not os.path.exists(latest_store.image_path):
+            return jsonify({"error": "No image available"}), 404
+        return send_file(latest_store.image_path, mimetype="image/jpeg"), 200
 
     @app.get("/health")
     def health() -> tuple[Any, int]:
@@ -330,6 +487,10 @@ def create_app(
 
         try:
             processed = event_processor.process_webhook(payload)
+            result = _extract_event_meta(payload, runtime_config.camera_map)
+            if result is not None:
+                meta, thumbnail = result
+                latest_store.update(meta, thumbnail)
             return jsonify({"status": "ok", "processed": processed}), 200
         except ValueError:
             return jsonify({"status": "error", "error": "Invalid webhook payload"}), 400
